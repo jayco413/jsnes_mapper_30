@@ -237,6 +237,15 @@ class ROM {
   }
 
   getMirroringType() {
+    if (
+      this.mapperType === 30 &&
+      this.subMapper !== 3 &&
+      this.fourScreen &&
+      this.mirroring === 0
+    ) {
+      return this.SINGLESCREEN_MIRRORING;
+    }
+
     if (this.fourScreen) {
       return this.FOURSCREEN_MIRRORING;
     }
