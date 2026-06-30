@@ -55,11 +55,26 @@ function createMockNes() {
       VERTICAL_MIRRORING: 0,
       FOURSCREEN_MIRRORING: 2,
       SINGLESCREEN_MIRRORING: 3,
+      SINGLESCREEN_MIRRORING2: 4,
     },
     opts: {
       onBatteryRamWrite: function () {},
     },
   };
+}
+
+function createMapper30MockNes(options = {}) {
+  let mockNes = createMockNes();
+  mockNes.rom.romCount = options.romCount ?? 32;
+  mockNes.rom.vromCount = 0;
+  mockNes.rom.chrRamSize = options.chrRamSize ?? 32768;
+  mockNes.rom.subMapper = options.subMapper ?? 1;
+  mockNes.rom.isNES2 = options.isNES2 ?? true;
+  mockNes.rom.batteryRam = options.batteryRam ?? true;
+  mockNes.rom.fourScreen = options.fourScreen ?? false;
+  mockNes.rom.mirroring = options.mirroring ?? 0;
+  populateMockRom(mockNes);
+  return mockNes;
 }
 
 // Fill mock ROM with identifiable data so we can verify bank switching
@@ -151,6 +166,105 @@ describe("Mappers", function () {
 
       assert.strictEqual(mockNes.cpu.mem[romAddress], originalValue);
     });
+  });
+});
+
+// --- UNROM 512 (Mapper 30) Tests ---
+describe("UNROM 512 (Mapper 30)", function () {
+  let mapper = null;
+  let mockNes = null;
+
+  beforeEach(function () {
+    mockNes = createMapper30MockNes();
+    mapper = new Mappers[30](mockNes);
+    mockNes.mmap = mapper;
+    mapper.loadROM();
+  });
+
+  it("is registered as mapper 30", function () {
+    assert.strictEqual(Mappers[30].mapperName, "UNROM 512");
+  });
+
+  it("loads the first PRG bank at $8000 and last PRG bank at $C000", function () {
+    assert.strictEqual(mockNes.cpu.mem[0x8000], mockNes.rom.rom[0][0]);
+    assert.strictEqual(mockNes.cpu.mem[0xc000], mockNes.rom.rom[31][0]);
+  });
+
+  it("selects a 16 KB PRG bank with register bits 0-4", function () {
+    mapper.write(0xc000, 0x05);
+
+    assert.strictEqual(mockNes.cpu.mem[0x8000], mockNes.rom.rom[5][0]);
+    assert.strictEqual(mockNes.cpu.mem[0xc000], mockNes.rom.rom[31][0]);
+  });
+
+  it("keeps separate 8 KB CHR-RAM banks selected by register bits 5-6", function () {
+    mockNes.ppu.vramMem[0x0000] = 0xaa;
+
+    mapper.write(0xc000, 0x20);
+    assert.strictEqual(mockNes.ppu.vramMem[0x0000], 0x00);
+
+    mockNes.ppu.vramMem[0x0000] = 0xbb;
+
+    mapper.write(0xc000, 0x00);
+    assert.strictEqual(mockNes.ppu.vramMem[0x0000], 0xaa);
+
+    mapper.write(0xc000, 0x20);
+    assert.strictEqual(mockNes.ppu.vramMem[0x0000], 0xbb);
+  });
+
+  it("allows PPU writes to mapper 30 CHR-RAM", function () {
+    assert.strictEqual(mapper.canWriteChr(0x0000), true);
+    assert.strictEqual(mapper.canWriteChr(0x1fff), true);
+    assert.strictEqual(mapper.canWriteChr(0x2000), false);
+  });
+
+  it("uses bit 7 for switchable one-screen mirroring when the header requests it", function () {
+    let mirroring = null;
+    mockNes = createMapper30MockNes({
+      fourScreen: true,
+      mirroring: 0,
+    });
+    mockNes.ppu.setMirroring = function (mode) {
+      mirroring = mode;
+    };
+    mapper = new Mappers[30](mockNes);
+    mapper.loadROM();
+
+    mapper.write(0xc000, 0x80);
+    assert.strictEqual(mirroring, mockNes.rom.SINGLESCREEN_MIRRORING2);
+
+    mapper.write(0xc000, 0x00);
+    assert.strictEqual(mirroring, mockNes.rom.SINGLESCREEN_MIRRORING);
+  });
+
+  it("uses bit 7 for horizontal or vertical mirroring on submapper 3", function () {
+    let mirroring = null;
+    mockNes = createMapper30MockNes({
+      subMapper: 3,
+    });
+    mockNes.ppu.setMirroring = function (mode) {
+      mirroring = mode;
+    };
+    mapper = new Mappers[30](mockNes);
+    mapper.loadROM();
+
+    mapper.write(0xc000, 0x00);
+    assert.strictEqual(mirroring, mockNes.rom.HORIZONTAL_MIRRORING);
+
+    mapper.write(0xc000, 0x80);
+    assert.strictEqual(mirroring, mockNes.rom.VERTICAL_MIRRORING);
+  });
+
+  it("applies bus conflicts for NES 2.0 submapper 2", function () {
+    mockNes = createMapper30MockNes({
+      subMapper: 2,
+    });
+    mapper = new Mappers[30](mockNes);
+    mapper.loadROM();
+
+    mapper.write(0xc000, 0x1f);
+
+    assert.strictEqual(mockNes.cpu.mem[0x8000], mockNes.rom.rom[16][0]);
   });
 });
 
