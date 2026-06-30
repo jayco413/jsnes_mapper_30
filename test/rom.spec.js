@@ -398,6 +398,20 @@ describe("ROM", function () {
       rom.load(data);
       assert.strictEqual(rom.fourScreen, true);
     });
+
+    it("maps mapper 30 one-screen header flags to single-screen mirroring", function () {
+      const data = buildHeader({
+        4: 1,
+        5: 0,
+        6: 0xe8, // mapper low nibble 0xE + mapper 30 one-screen flag pattern
+        7: 0x10,
+      });
+      const rom = new ROM(mockNes());
+      rom.load(data);
+
+      assert.strictEqual(rom.mapperType, 30);
+      assert.strictEqual(rom.getMirroringType(), rom.SINGLESCREEN_MIRRORING);
+    });
   });
 
   describe("trainer offset", function () {
