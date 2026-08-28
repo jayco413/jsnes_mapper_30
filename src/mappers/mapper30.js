@@ -1,6 +1,7 @@
 import Mapper0 from "./mapper0.js";
 import Tile from "../tile.js";
 import { copyArrayElements } from "../utils.js";
+import Flash39SF040 from "./flash39sf040.js";
 
 const CHR_RAM_BANK_SIZE = 0x2000;
 const DEFAULT_CHR_RAM_BANK_COUNT = 4;
@@ -23,6 +24,11 @@ class Mapper30 extends Mapper0 {
     this.chrRamMapped = false;
     this.mirroringBit = 0;
     this.leds = 0xff;
+
+    // Self-flashing (see writeRegister below). Only built when the ROM says
+    // the board supports it, so a plain mapper-30 ROM behaves exactly as it
+    // did before this existed.
+    this.flash = this.createFlash();
 
     this.chrRamBankCount = this.getChrRamBankCount();
     this.chrRam = new Uint8Array(this.chrRamBankCount * CHR_RAM_BANK_SIZE);
@@ -51,6 +57,39 @@ class Mapper30 extends Mapper0 {
     );
   }
 
+  /**
+   * Decides whether this cartridge can rewrite its own flash.
+   *
+   * UNROM 512 boards come in variants, and only some of them can self-flash.
+   * NESdev's rule: flash saving is available on submappers 0, 1 and 4 with the
+   * battery bit set, and requires a board WITHOUT bus conflicts - submapper 2
+   * declares bus conflicts and is explicitly incompatible with self-flashing.
+   *
+   * Gating on that matters for correctness here, not just tidiness: without
+   * it, every ordinary mapper-30 ROM would suddenly have its $8000-$BFFF
+   * writes inspected by a flash state machine, and this emulator's existing
+   * behaviour for those ROMs must not change at all.
+   */
+  createFlash() {
+    const rom = this.nes.rom;
+    if (!rom || !rom.batteryRam) {
+      return null;
+    }
+    // A ROM with no banks loaded yet cannot be flashed; this also keeps the
+    // minimal mocks used by unit tests from constructing a zero-sized chip.
+    if (!Array.isArray(rom.rom) || rom.rom.length === 0) {
+      return null;
+    }
+    const subMapper = rom.subMapper ?? 0;
+    if (subMapper !== 0 && subMapper !== 1 && subMapper !== 4) {
+      return null;
+    }
+    if (this.hasBusConflicts()) {
+      return null;
+    }
+    return new Flash39SF040(rom.rom, { bankSize: 0x4000 });
+  }
+
   write(address, value) {
     if (address < 0x8000) {
       super.write(address, value);
@@ -64,7 +103,62 @@ class Mapper30 extends Mapper0 {
       return;
     }
 
+    // A write in $8000-$BFFF goes to BOTH the mapper's bank latch and the
+    // flash chip. That sounds alarming and is in fact how the board is meant
+    // to work: the flash's write-enable is wired to the $8000-$BFFF window
+    // only, so a game sets the bank by writing to the FIXED window at
+    // $C000-$FFFF - which the flash never sees - and then issues the flash
+    // command through $8000-$BFFF. NESdev documents the resulting sequences
+    // in exactly that shape, for example programming one byte:
+    //
+    //     $C000:$01  $9555:$AA      ; bank 1, so $9555 is chip address $5555
+    //     $C000:$00  $AAAA:$55      ; bank 0, so $AAAA is chip address $2AAA
+    //     $C000:$01  $9555:$A0      ; "the next write is data"
+    //     $C000:BANK ADDR:DATA
+    //
+    // The address the flash sees is formed from the bank that is CURRENTLY
+    // latched, before this write updates it - the latch only changes at the
+    // end of the cycle. Getting that order wrong would break every documented
+    // sequence, because each one relies on the bank set by the previous write.
+    if (this.flash && address < 0xc000) {
+      const chipAddress = this.prgBank * 0x4000 + (address - 0x8000);
+      this.flash.write(chipAddress, value);
+    }
+
     this.writeRegister(address, value);
+
+    // Programming or erasing changes bytes inside a bank that may be the one
+    // currently mapped into the CPU's address space, so re-present it.
+    if (this.flash) {
+      this.refreshMappedBanks();
+    }
+  }
+
+  /**
+   * Re-copies the currently visible PRG banks out of the cartridge arrays,
+   * so bytes the game just programmed are what the CPU reads back. Without
+   * this, a save would appear to work and then read as stale data.
+   */
+  refreshMappedBanks() {
+    this.loadRomBank(this.prgBank, 0x8000);
+    this.loadRomBank(this.nes.rom.romCount - 1, 0xc000);
+  }
+
+  /**
+   * Reads in $8000-$FFFF normally come straight from the mapped bank, but a
+   * flash chip that is mid-program answers with status bits instead of data,
+   * and that is what game code polls to know the write has finished.
+   */
+  load(address) {
+    if (this.flash && address >= 0x8000) {
+      const bank = address < 0xc000 ? this.prgBank : this.nes.rom.romCount - 1;
+      const windowBase = address < 0xc000 ? 0x8000 : 0xc000;
+      const status = this.flash.read(bank * 0x4000 + (address - windowBase));
+      if (status !== null) {
+        return status;
+      }
+    }
+    return super.load(address);
   }
 
   writeRegister(address, value) {
