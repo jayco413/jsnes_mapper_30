@@ -98,40 +98,51 @@ class Mapper30 extends Mapper0 {
 
     value &= 0xff;
 
-    if (this.nes.rom.subMapper === 4 && address < 0xc000) {
-      this.leds = value;
-      return;
-    }
-
-    // A write in $8000-$BFFF goes to BOTH the mapper's bank latch and the
-    // flash chip. That sounds alarming and is in fact how the board is meant
-    // to work: the flash's write-enable is wired to the $8000-$BFFF window
-    // only, so a game sets the bank by writing to the FIXED window at
-    // $C000-$FFFF - which the flash never sees - and then issues the flash
-    // command through $8000-$BFFF. NESdev documents the resulting sequences
-    // in exactly that shape, for example programming one byte:
+    // ---- Self-flashing boards split the cartridge write space in two ----
+    //
+    // On an ordinary UNROM 512, every write in $8000-$FFFF clocks the mapper
+    // latch. A self-flashable board wires it differently: $8000-$BFFF drives
+    // the flash chip's write-enable, and ONLY $C000-$FFFF clocks the latch.
+    //
+    // That split is what makes flash commands expressible at all. A game has
+    // to aim the chip's upper address lines - which come from the bank
+    // register - while sending command bytes to specific low addresses. If
+    // command writes also moved the bank, every command would move the target
+    // out from under itself, and a game could not flash without destroying its
+    // own memory map. NESdev's documented sequences show this directly: the
+    // bank is always set through $C000, never through the command window.
     //
     //     $C000:$01  $9555:$AA      ; bank 1, so $9555 is chip address $5555
     //     $C000:$00  $AAAA:$55      ; bank 0, so $AAAA is chip address $2AAA
     //     $C000:$01  $9555:$A0      ; "the next write is data"
     //     $C000:BANK ADDR:DATA
     //
-    // The address the flash sees is formed from the bank that is CURRENTLY
-    // latched, before this write updates it - the latch only changes at the
-    // end of the cycle. Getting that order wrong would break every documented
-    // sequence, because each one relies on the bank set by the previous write.
+    // An earlier version of this file sent flash-window writes to the latch as
+    // well, which happened to produce the right chip addresses for the
+    // documented sequences - each step re-sets the bank anyway - while
+    // silently corrupting the running game's bank state. An independent
+    // review caught it.
     if (this.flash && address < 0xc000) {
+      if (this.nes.rom.subMapper === 4) {
+        // Submapper 4 adds a cartridge-shell LED register in this window. It
+        // does not take the window away from the flash: the write reaches
+        // both.
+        this.leds = value;
+      }
       const chipAddress = this.prgBank * 0x4000 + (address - 0x8000);
       this.flash.write(chipAddress, value);
+      // A programmed or erased byte may be inside a bank the CPU can currently
+      // see, so re-present the mapped windows.
+      this.refreshMappedBanks();
+      return;
+    }
+
+    if (this.nes.rom.subMapper === 4 && address < 0xc000) {
+      this.leds = value;
+      return;
     }
 
     this.writeRegister(address, value);
-
-    // Programming or erasing changes bytes inside a bank that may be the one
-    // currently mapped into the CPU's address space, so re-present it.
-    if (this.flash) {
-      this.refreshMappedBanks();
-    }
   }
 
   /**

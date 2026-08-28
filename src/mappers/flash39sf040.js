@@ -49,14 +49,30 @@ const COMMAND_CHIP_ERASE = 0x10;
 const SECTOR_SIZE = 0x1000; // 4 KB, per the datasheet's erase granularity.
 const ERASED_BYTE = 0xff;
 
-// How many reads a program or erase appears to take. The real chip is busy
-// for microseconds (program) or milliseconds (erase), during which reads
-// return status bits rather than data, and well-written game code polls until
-// the data reads back correctly. Emulating that as "a few reads" rather than
-// "instantly" is deliberate: a game that forgets to poll will read status
-// bytes instead of its data and misbehave here, which is exactly what it
-// would do on hardware. Completing instantly would hide that bug.
-const DEFAULT_BUSY_READS = 3;
+// How long a program or erase appears to take, measured in reads of the chip.
+//
+// The real part is busy for very different lengths of time depending on the
+// operation - roughly 20 microseconds to program one byte, 25 milliseconds to
+// erase a sector, 100 milliseconds to erase the whole chip - and during that
+// window reads return status bits instead of data. Well-written game code
+// polls until the data reads back correctly, which is exactly what NESdev's
+// UNROM 512 note tells NES programmers to do.
+//
+// Modelling that as a number of READS rather than elapsed CPU cycles is a
+// deliberate limitation, and worth being honest about. It catches the bug that
+// actually matters for a polling game - code that never polls, or polls once,
+// reads status bytes as if they were its data, exactly as it would on
+// hardware. It does NOT catch a game that waits a fixed, too-short delay
+// instead of polling, because there is no emulated clock here for such a delay
+// to be short against. A cycle-accurate model would need a monotonic cycle
+// counter in the CPU core; that is a change to a hot loop and is left as
+// follow-up rather than smuggled in here.
+//
+// The relative durations are kept faithful even so, because a save system's
+// behaviour depends on an erase costing far more than a program.
+const BUSY_READS_PROGRAM = 3;
+const BUSY_READS_SECTOR_ERASE = 24;
+const BUSY_READS_CHIP_ERASE = 96;
 
 // Command state machine positions.
 const STATE_READ = 0; // idle: reads return data, writes may start a command
@@ -79,7 +95,10 @@ class Flash39SF040 {
   constructor(banks, options = {}) {
     this.banks = banks;
     this.bankSize = options.bankSize ?? 0x4000;
-    this.busyReads = options.busyReads ?? DEFAULT_BUSY_READS;
+    // A test can shorten these; nothing else should.
+    this.busyReadsProgram = options.busyReads ?? BUSY_READS_PROGRAM;
+    this.busyReadsSectorErase = options.busyReads ?? BUSY_READS_SECTOR_ERASE;
+    this.busyReadsChipErase = options.busyReads ?? BUSY_READS_CHIP_ERASE;
 
     this.state = STATE_READ;
     this.softwareIdMode = false;
@@ -176,8 +195,11 @@ class Flash39SF040 {
     const commandAddress = chipAddress & COMMAND_ADDRESS_MASK;
     const data = value & 0xff;
 
-    // A program or erase in progress ignores everything except the reset
-    // command, exactly as the datasheet specifies.
+    // A busy chip ignores EVERY write, including the read/reset command: the
+    // SST39SF040 has no erase-suspend and no way to abort an operation in
+    // flight. Confirmed against the datasheet during independent review, which
+    // is worth recording because the opposite - letting reset through - is the
+    // intuitive guess and would be wrong.
     if (this.busyRemaining > 0) {
       this.rejectedWriteCount += 1;
       return;
@@ -232,7 +254,7 @@ class Flash39SF040 {
         const programmed = previous & data;
         this.setByteAt(chipAddress, programmed);
         this.programCount += 1;
-        this.beginBusy(programmed);
+        this.beginBusy(programmed, this.busyReadsProgram);
         this.state = STATE_READ;
         return;
       }
@@ -257,14 +279,14 @@ class Flash39SF040 {
         if (data === COMMAND_SECTOR_ERASE) {
           this.eraseSector(chipAddress);
           this.sectorEraseCount += 1;
-          this.beginBusy(ERASED_BYTE);
+          this.beginBusy(ERASED_BYTE, this.busyReadsSectorErase);
         } else if (
           data === COMMAND_CHIP_ERASE &&
           commandAddress === COMMAND_ADDRESS_1
         ) {
           this.eraseChip();
           this.chipEraseCount += 1;
-          this.beginBusy(ERASED_BYTE);
+          this.beginBusy(ERASED_BYTE, this.busyReadsChipErase);
         } else {
           this.abort();
           return;
@@ -282,8 +304,8 @@ class Flash39SF040 {
     this.rejectedWriteCount += 1;
   }
 
-  beginBusy(expectedValue) {
-    this.busyRemaining = this.busyReads;
+  beginBusy(expectedValue, reads) {
+    this.busyRemaining = reads;
     this.busyToggle = false;
     this.busyExpectedValue = expectedValue & 0xff;
   }

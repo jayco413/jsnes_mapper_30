@@ -245,18 +245,51 @@ describe("UNROM 512 self-flashing", function () {
     assert.strictEqual(nes.rom.rom[28][0x0010], 0xff);
   });
 
-  it("still switches banks while a flash sequence is in flight", function () {
-    // Each command write doubles as a bank-latch write, which is exactly why
-    // the documented sequence re-sets the bank through $C000 before every
-    // step. If the latch stopped updating, every sequence would address the
-    // wrong part of the chip.
+  it("leaves the bank alone when a flash command goes through $8000-$BFFF", function () {
+    // On a self-flashing board only $C000-$FFFF clocks the mapper latch;
+    // $8000-$BFFF drives the flash chip instead. This is the property that
+    // lets a game flash without destroying its own memory map, and an
+    // earlier version of this code got it backwards - command writes moved
+    // the bank, which happened to still produce the right chip addresses for
+    // the documented sequences because each step re-sets the bank anyway.
     const nes = createNes();
     const mapper = new Mappers[30](nes);
     mapper.loadROM();
 
     mapper.write(0xc000, 0x01);
+    assert.strictEqual(mapper.prgBank, 0x01, "$C000 does set the bank");
+    mapper.write(0x9555, 0xaa);
+    assert.strictEqual(
+      mapper.prgBank,
+      0x01,
+      "a command write must not move the bank",
+    );
+  });
+
+  it("still latches banks from $8000-$BFFF on a NON-flash board", function () {
+    // The rule above applies only to self-flashing boards. An ordinary
+    // mapper-30 ROM must keep the original behaviour exactly.
+    const nes = createNes({ batteryRam: false });
+    const mapper = new Mappers[30](nes);
+    mapper.loadROM();
+
     mapper.write(0x9555, 0xaa);
     assert.strictEqual(mapper.prgBank, 0xaa & 0x1f);
+  });
+
+  it("reaches both the LEDs and the flash on submapper 4", function () {
+    // Submapper 4 adds a cartridge-shell LED register in the same window the
+    // flash uses. It does not take the window away from the flash; an earlier
+    // version returned after setting the LEDs and silently disabled saving on
+    // exactly the boards that advertise it.
+    const nes = createNes({ subMapper: 4 });
+    const mapper = new Mappers[30](nes);
+    mapper.loadROM();
+    assert.notStrictEqual(mapper.flash, null, "submapper 4 can self-flash");
+
+    programByte(mapper, 28, 0x8123, 0x42);
+    assert.strictEqual(nes.rom.rom[28][0x0123], 0x42, "the flash saw it");
+    assert.strictEqual(mapper.leds, 0x42, "and so did the LED register");
   });
 
   it("refuses a second command while the previous one is still busy", function () {
@@ -284,6 +317,34 @@ describe("UNROM 512 self-flashing", function () {
       nes.rom.rom[28][0x0201],
       0x22,
       "and works after polling",
+    );
+  });
+
+  it("makes an erase take far longer than a program", function () {
+    // A save system's wear behaviour depends on this asymmetry, so the model
+    // keeps the datasheet's relative costs even though it counts reads rather
+    // than microseconds.
+    const nes = createNes();
+    const mapper = new Mappers[30](nes);
+    mapper.loadROM();
+
+    programByte(mapper, 28, 0x8300, 0x00);
+    let programReads = 0;
+    while (mapper.flash.isBusy()) {
+      mapper.load(0x8300);
+      programReads += 1;
+    }
+
+    eraseSector(mapper, 28, 0x8300);
+    let eraseReads = 0;
+    while (mapper.flash.isBusy()) {
+      mapper.load(0x8300);
+      eraseReads += 1;
+    }
+
+    assert.ok(
+      eraseReads > programReads * 4,
+      `an erase (${eraseReads} reads) must cost far more than a program (${programReads})`,
     );
   });
 
