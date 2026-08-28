@@ -1,6 +1,7 @@
 import Mapper0 from "./mapper0.js";
 import Tile from "../tile.js";
 import { copyArrayElements } from "../utils.js";
+import Flash39SF040 from "./flash39sf040.js";
 
 const CHR_RAM_BANK_SIZE = 0x2000;
 const DEFAULT_CHR_RAM_BANK_COUNT = 4;
@@ -23,6 +24,11 @@ class Mapper30 extends Mapper0 {
     this.chrRamMapped = false;
     this.mirroringBit = 0;
     this.leds = 0xff;
+
+    // Self-flashing (see writeRegister below). Only built when the ROM says
+    // the board supports it, so a plain mapper-30 ROM behaves exactly as it
+    // did before this existed.
+    this.flash = this.createFlash();
 
     this.chrRamBankCount = this.getChrRamBankCount();
     this.chrRam = new Uint8Array(this.chrRamBankCount * CHR_RAM_BANK_SIZE);
@@ -51,6 +57,39 @@ class Mapper30 extends Mapper0 {
     );
   }
 
+  /**
+   * Decides whether this cartridge can rewrite its own flash.
+   *
+   * UNROM 512 boards come in variants, and only some of them can self-flash.
+   * NESdev's rule: flash saving is available on submappers 0, 1 and 4 with the
+   * battery bit set, and requires a board WITHOUT bus conflicts - submapper 2
+   * declares bus conflicts and is explicitly incompatible with self-flashing.
+   *
+   * Gating on that matters for correctness here, not just tidiness: without
+   * it, every ordinary mapper-30 ROM would suddenly have its $8000-$BFFF
+   * writes inspected by a flash state machine, and this emulator's existing
+   * behaviour for those ROMs must not change at all.
+   */
+  createFlash() {
+    const rom = this.nes.rom;
+    if (!rom || !rom.batteryRam) {
+      return null;
+    }
+    // A ROM with no banks loaded yet cannot be flashed; this also keeps the
+    // minimal mocks used by unit tests from constructing a zero-sized chip.
+    if (!Array.isArray(rom.rom) || rom.rom.length === 0) {
+      return null;
+    }
+    const subMapper = rom.subMapper ?? 0;
+    if (subMapper !== 0 && subMapper !== 1 && subMapper !== 4) {
+      return null;
+    }
+    if (this.hasBusConflicts()) {
+      return null;
+    }
+    return new Flash39SF040(rom.rom, { bankSize: 0x4000 });
+  }
+
   write(address, value) {
     if (address < 0x8000) {
       super.write(address, value);
@@ -59,12 +98,112 @@ class Mapper30 extends Mapper0 {
 
     value &= 0xff;
 
-    if (this.nes.rom.subMapper === 4 && address < 0xc000) {
-      this.leds = value;
+    // ---- Self-flashing boards split the cartridge write space in two ----
+    //
+    // On an ordinary UNROM 512, every write in $8000-$FFFF clocks the mapper
+    // latch. A self-flashable board wires it differently: $8000-$BFFF drives
+    // the flash chip's write-enable, and ONLY $C000-$FFFF clocks the latch.
+    //
+    // That split is what makes flash commands expressible at all. A game has
+    // to aim the chip's upper address lines - which come from the bank
+    // register - while sending command bytes to specific low addresses. If
+    // command writes also moved the bank, every command would move the target
+    // out from under itself, and a game could not flash without destroying its
+    // own memory map. NESdev's documented sequences show this directly: the
+    // bank is always set through $C000, never through the command window.
+    //
+    //     $C000:$01  $9555:$AA      ; bank 1, so $9555 is chip address $5555
+    //     $C000:$00  $AAAA:$55      ; bank 0, so $AAAA is chip address $2AAA
+    //     $C000:$01  $9555:$A0      ; "the next write is data"
+    //     $C000:BANK ADDR:DATA
+    //
+    // An earlier version of this file sent flash-window writes to the latch as
+    // well, which happened to produce the right chip addresses for the
+    // documented sequences - each step re-sets the bank anyway - while
+    // silently corrupting the running game's bank state. An independent
+    // review caught it.
+    if (this.latchesFromEntireCartridgeWindow()) {
+      // Boards in this group behave the classic UxROM way: any write in
+      // $8000-$FFFF clocks the latch, and there is no flash to talk to.
+      this.writeRegister(address, value);
+      return;
+    }
+
+    if (address < 0xc000) {
+      if (this.nes.rom.subMapper === 4) {
+        // Submapper 4 adds a cartridge-shell LED register in this window. It
+        // does not take the window away from the flash: the write reaches
+        // both.
+        this.leds = value;
+      }
+      if (this.flash) {
+        const chipAddress = this.prgBank * 0x4000 + (address - 0x8000);
+        this.flash.write(chipAddress, value);
+        // A programmed or erased byte may be inside a bank the CPU can
+        // currently see, so re-present the mapped windows.
+        this.refreshMappedBanks();
+      }
+      // Either way this half of the window does NOT reach the latch.
       return;
     }
 
     this.writeRegister(address, value);
+  }
+
+  /**
+   * Which addresses clock the mapper's bank/CHR/mirroring latch.
+   *
+   * UNROM 512 boards are wired one of two ways, and NESdev's register table
+   * splits them by submapper and battery bit rather than by whether a given
+   * ROM happens to use flash:
+   *
+   *   $8000-$FFFF latches - submapper 0 without the battery bit, submapper 2
+   *   $C000-$FFFF latches - submapper 0 with the battery bit, submappers 1, 3, 4
+   *
+   * On the second group the $8000-$BFFF half of the window belongs to the
+   * flash chip's write-enable (and, on submapper 4, to the LED register)
+   * instead. Keying this on the documented rule rather than on "did we
+   * construct a flash chip" matters for the boards in between: submapper 3
+   * never self-flashes but still latches only from $C000, and submapper 1
+   * without a battery bit likewise. An earlier version keyed it on chip
+   * existence and got all three of those wrong.
+   */
+  latchesFromEntireCartridgeWindow() {
+    const subMapper = this.nes.rom.subMapper ?? 0;
+    if (subMapper === 2) {
+      return true;
+    }
+    if (subMapper === 0) {
+      return !this.nes.rom.batteryRam;
+    }
+    return false;
+  }
+
+  /**
+   * Re-copies the currently visible PRG banks out of the cartridge arrays,
+   * so bytes the game just programmed are what the CPU reads back. Without
+   * this, a save would appear to work and then read as stale data.
+   */
+  refreshMappedBanks() {
+    this.loadRomBank(this.prgBank, 0x8000);
+    this.loadRomBank(this.nes.rom.romCount - 1, 0xc000);
+  }
+
+  /**
+   * Reads in $8000-$FFFF normally come straight from the mapped bank, but a
+   * flash chip that is mid-program answers with status bits instead of data,
+   * and that is what game code polls to know the write has finished.
+   */
+  load(address) {
+    if (this.flash && address >= 0x8000) {
+      const bank = address < 0xc000 ? this.prgBank : this.nes.rom.romCount - 1;
+      const windowBase = address < 0xc000 ? 0x8000 : 0xc000;
+      const status = this.flash.read(bank * 0x4000 + (address - windowBase));
+      if (status !== null) {
+        return status;
+      }
+    }
+    return super.load(address);
   }
 
   writeRegister(address, value) {
