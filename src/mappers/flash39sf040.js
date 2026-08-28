@@ -68,8 +68,19 @@ const ERASED_BYTE = 0xff;
 // counter in the CPU core; that is a change to a hot loop and is left as
 // follow-up rather than smuggled in here.
 //
-// The relative durations are kept faithful even so, because a save system's
-// behaviour depends on an erase costing far more than a program.
+// The ORDERING is kept - an erase costs far more polls than a program, which
+// a save system's wear behaviour depends on - but the magnitudes are heavily
+// compressed. The datasheet's maxima are about 20 microseconds, 25
+// milliseconds and 70 milliseconds, a ratio near 1 : 1250 : 3500; these
+// constants are 1 : 8 : 32. Do not read a real duration out of them.
+//
+// The consequence worth naming: a sector erase on hardware is 18-25 ms, which
+// is longer than a whole frame, and for all of it every read of $8000-$FFFF
+// returns status rather than data. Real flashing code must therefore run from
+// internal RAM with NMI disabled, or its handler and vectors will be fetched
+// from a chip that is answering with status bits. This model finishes an erase
+// after a couple of dozen reads, so it CANNOT catch a game that leaves NMI
+// enabled during one. That has to be proved on the game's side.
 const BUSY_READS_PROGRAM = 3;
 const BUSY_READS_SECTOR_ERASE = 24;
 const BUSY_READS_CHIP_ERASE = 96;
@@ -172,10 +183,19 @@ class Flash39SF040 {
     }
 
     if (this.softwareIdMode) {
-      // Manufacturer (SST = $BF) at even addresses, device ID ($B7 for the
-      // SST39SF040) at odd. Games use this to confirm which chip they are
-      // talking to before risking a write.
-      return (chipAddress & 1) === 0 ? 0xbf : 0xb7;
+      // Manufacturer (SST = $BF) then device ID ($B7 for the SST39SF040).
+      // The datasheet scopes these to addresses $0000 and $0001 - every other
+      // address still reads as ordinary data even in ID mode - so this checks
+      // the whole address rather than just its low bit. Returning the ID
+      // everywhere would mean the CPU could not even fetch its own reset
+      // vectors while ID mode was active.
+      if (chipAddress === 0x0000) {
+        return 0xbf;
+      }
+      if (chipAddress === 0x0001) {
+        return 0xb7;
+      }
+      return null;
     }
 
     return null;

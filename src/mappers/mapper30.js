@@ -122,27 +122,61 @@ class Mapper30 extends Mapper0 {
     // documented sequences - each step re-sets the bank anyway - while
     // silently corrupting the running game's bank state. An independent
     // review caught it.
-    if (this.flash && address < 0xc000) {
+    if (this.latchesFromEntireCartridgeWindow()) {
+      // Boards in this group behave the classic UxROM way: any write in
+      // $8000-$FFFF clocks the latch, and there is no flash to talk to.
+      this.writeRegister(address, value);
+      return;
+    }
+
+    if (address < 0xc000) {
       if (this.nes.rom.subMapper === 4) {
         // Submapper 4 adds a cartridge-shell LED register in this window. It
         // does not take the window away from the flash: the write reaches
         // both.
         this.leds = value;
       }
-      const chipAddress = this.prgBank * 0x4000 + (address - 0x8000);
-      this.flash.write(chipAddress, value);
-      // A programmed or erased byte may be inside a bank the CPU can currently
-      // see, so re-present the mapped windows.
-      this.refreshMappedBanks();
-      return;
-    }
-
-    if (this.nes.rom.subMapper === 4 && address < 0xc000) {
-      this.leds = value;
+      if (this.flash) {
+        const chipAddress = this.prgBank * 0x4000 + (address - 0x8000);
+        this.flash.write(chipAddress, value);
+        // A programmed or erased byte may be inside a bank the CPU can
+        // currently see, so re-present the mapped windows.
+        this.refreshMappedBanks();
+      }
+      // Either way this half of the window does NOT reach the latch.
       return;
     }
 
     this.writeRegister(address, value);
+  }
+
+  /**
+   * Which addresses clock the mapper's bank/CHR/mirroring latch.
+   *
+   * UNROM 512 boards are wired one of two ways, and NESdev's register table
+   * splits them by submapper and battery bit rather than by whether a given
+   * ROM happens to use flash:
+   *
+   *   $8000-$FFFF latches - submapper 0 without the battery bit, submapper 2
+   *   $C000-$FFFF latches - submapper 0 with the battery bit, submappers 1, 3, 4
+   *
+   * On the second group the $8000-$BFFF half of the window belongs to the
+   * flash chip's write-enable (and, on submapper 4, to the LED register)
+   * instead. Keying this on the documented rule rather than on "did we
+   * construct a flash chip" matters for the boards in between: submapper 3
+   * never self-flashes but still latches only from $C000, and submapper 1
+   * without a battery bit likewise. An earlier version keyed it on chip
+   * existence and got all three of those wrong.
+   */
+  latchesFromEntireCartridgeWindow() {
+    const subMapper = this.nes.rom.subMapper ?? 0;
+    if (subMapper === 2) {
+      return true;
+    }
+    if (subMapper === 0) {
+      return !this.nes.rom.batteryRam;
+    }
+    return false;
   }
 
   /**

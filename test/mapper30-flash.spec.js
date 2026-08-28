@@ -209,10 +209,83 @@ describe("SST39SF040 flash chip", function () {
     assert.strictEqual(banks[0][0x0400], 0x0f);
   });
 
+  it("erases the whole chip, and only from the command address", function () {
+    // Chip erase is the one command that can wipe the game's own code off the
+    // cartridge, and it had no coverage at all until an independent review
+    // mutation-tested this file and found that deleting eraseChip() entirely
+    // left every test passing.
+    unlock(0xa0);
+    flash.write(0x0010, 0x00);
+    unlock(0xa0);
+    flash.write(0x4010, 0x11); // a different bank
+
+    // $10 at any address other than $5555 is not a chip erase.
+    flash.write(0x5555, 0xaa);
+    flash.write(0x2aaa, 0x55);
+    flash.write(0x5555, 0x80);
+    flash.write(0x5555, 0xaa);
+    flash.write(0x2aaa, 0x55);
+    flash.write(0x1234, 0x10);
+    assert.strictEqual(flash.chipEraseCount, 0, "wrong address, no chip erase");
+    assert.strictEqual(banks[0][0x0010], 0x00, "and nothing was erased");
+
+    flash.write(0x5555, 0xaa);
+    flash.write(0x2aaa, 0x55);
+    flash.write(0x5555, 0x80);
+    flash.write(0x5555, 0xaa);
+    flash.write(0x2aaa, 0x55);
+    flash.write(0x5555, 0x10);
+    assert.strictEqual(flash.chipEraseCount, 1);
+    assert.strictEqual(banks[0][0x0010], 0xff, "first bank erased");
+    assert.strictEqual(banks[1][0x0010], 0xff, "second bank erased too");
+  });
+
+  it("recognises a command sequence issued from a high bank", function () {
+    // Only A14-A0 take part in command decoding; the upper address lines are
+    // don't-care. A game issuing the sequence from bank 3 therefore writes
+    // chip address $D555, which must still be seen as $5555. Without this,
+    // widening COMMAND_ADDRESS_MASK went undetected.
+    const high = 3 * 0x4000; // $C000, whose low 15 bits are $4000
+    flash.write(high + 0x1555, 0xaa); // chip $D555 -> command $5555
+    flash.write(0x2aaa, 0x55);
+    flash.write(high + 0x1555, 0xa0);
+    flash.write(0x0500, 0x33);
+    assert.strictEqual(banks[0][0x0500], 0x33, "the high-bank unlock worked");
+  });
+
+  it("ignores every write while busy, including the reset command", function () {
+    // The SST39SF040 has no erase-suspend, and the datasheet says the software
+    // reset command is ignored during an internal program or erase. The code
+    // was already right; nothing pinned it.
+    const busy = new Flash39SF040(banks, { bankSize: 0x4000, busyReads: 4 });
+    busy.write(0x5555, 0xaa);
+    busy.write(0x2aaa, 0x55);
+    busy.write(0x5555, 0xa0);
+    busy.write(0x0600, 0x77);
+    assert.ok(busy.isBusy());
+
+    busy.write(0x5555, 0xf0); // reset, which must NOT take effect
+    assert.ok(busy.isBusy(), "reset cannot abort an operation in flight");
+  });
+
+  it("checks the address on the erase sequence's own unlock cycles", function () {
+    flash.write(0x5555, 0xaa);
+    flash.write(0x2aaa, 0x55);
+    flash.write(0x5555, 0x80);
+    flash.write(0x1111, 0xaa); // wrong address for the 4th cycle
+    flash.write(0x2aaa, 0x55);
+    flash.write(0x0010, 0x30);
+    assert.strictEqual(flash.sectorEraseCount, 0, "the sequence was aborted");
+  });
+
   it("answers the software ID query", function () {
     unlock(0x90);
     assert.strictEqual(flash.read(0x0000), 0xbf, "SST manufacturer id");
     assert.strictEqual(flash.read(0x0001), 0xb7, "SST39SF040 device id");
+    // The datasheet scopes the identity to those two addresses. Everywhere
+    // else still reads as ordinary data, which is what lets the CPU keep
+    // fetching its own vectors while ID mode is active.
+    assert.strictEqual(flash.read(0x0002), null, "other addresses are data");
   });
 });
 
@@ -266,16 +339,46 @@ describe("UNROM 512 self-flashing", function () {
     );
   });
 
-  it("still latches banks from $8000-$BFFF on a NON-flash board", function () {
-    // The rule above applies only to self-flashing boards. An ordinary
-    // mapper-30 ROM must keep the original behaviour exactly.
-    const nes = createNes({ batteryRam: false });
-    const mapper = new Mappers[30](nes);
-    mapper.loadROM();
+  // Which addresses clock the latch is a property of the BOARD, not of
+  // whether a particular ROM uses flash. NESdev splits them by submapper and
+  // battery bit, and an earlier version of this code keyed it on "did we
+  // build a flash chip", which got three configurations wrong. Both groups
+  // are pinned here.
+  const latchesFromWholeWindow = [
+    { name: "submapper 0 without a battery", subMapper: 0, batteryRam: false },
+    { name: "submapper 2 (bus conflicts)", subMapper: 2, batteryRam: true },
+  ];
+  for (const board of latchesFromWholeWindow) {
+    it(`latches from $8000-$BFFF on ${board.name}`, function () {
+      const nes = createNes(board);
+      const mapper = new Mappers[30](nes);
+      mapper.loadROM();
+      mapper.write(0x9555, 0xaa);
+      assert.strictEqual(mapper.prgBank, 0xaa & 0x1f);
+    });
+  }
 
-    mapper.write(0x9555, 0xaa);
-    assert.strictEqual(mapper.prgBank, 0xaa & 0x1f);
-  });
+  const latchesFromFixedWindowOnly = [
+    { name: "submapper 0 with a battery", subMapper: 0, batteryRam: true },
+    { name: "submapper 1 without a battery", subMapper: 1, batteryRam: false },
+    { name: "submapper 3 with a battery", subMapper: 3, batteryRam: true },
+    { name: "submapper 3 without a battery", subMapper: 3, batteryRam: false },
+    { name: "submapper 4 with a battery", subMapper: 4, batteryRam: true },
+  ];
+  for (const board of latchesFromFixedWindowOnly) {
+    it(`does not latch from $8000-$BFFF on ${board.name}`, function () {
+      const nes = createNes(board);
+      const mapper = new Mappers[30](nes);
+      mapper.loadROM();
+      mapper.write(0xc000, 0x03);
+      mapper.write(0x9555, 0xaa);
+      assert.strictEqual(
+        mapper.prgBank,
+        0x03,
+        "only $C000-$FFFF may clock the latch on this board",
+      );
+    });
+  }
 
   it("reaches both the LEDs and the flash on submapper 4", function () {
     // Submapper 4 adds a cartridge-shell LED register in the same window the
