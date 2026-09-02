@@ -4,6 +4,7 @@ import PPU from "./ppu/index.js";
 import PAPU from "./papu/index.js";
 import GameGenie from "./gamegenie.js";
 import ROM from "./rom.js";
+import { SECTOR_SIZE } from "./mappers/flash39sf040.js";
 
 class NES {
   constructor(opts) {
@@ -12,6 +13,12 @@ class NES {
       onAudioSample: null,
       onStatusUpdate: function () {},
       onBatteryRamWrite: function () {},
+      // Called when a self-flashing cartridge's flash actually changes, with
+      // the index of the 4 KB sector affected. This is how a host page knows
+      // the player's saved game moved and should be written somewhere that
+      // outlives the tab. See the flash API below and
+      // src/mappers/flash39sf040.js for what "actually changes" excludes.
+      onFlashChange: null,
 
       emulateSound: true,
       sampleRate: 48000, // Sound sample rate in hz
@@ -173,6 +180,132 @@ class NES {
   // frequently per CPU cycle so each frame still fills the audio buffer.
   setFramerate(rate) {
     this.papu.setFrameRate(rate);
+  }
+
+  // ------------------------------------------------------------------
+  // Cartridge flash: reading and restoring the player's saved game.
+  //
+  // Games on UNROM 512 boards have no battery-backed RAM. They save by
+  // rewriting a spare corner of their own program flash, which on real
+  // hardware simply stays written. In an emulator it does not: the banks live
+  // in memory that vanishes with the page. These methods are the way out and
+  // back in.
+  //
+  // The unit is the chip's 4 KB SECTOR, because that is the smallest region
+  // flash can erase and therefore the smallest region a game can rewrite from
+  // scratch. A save is usually one or two of them, so persisting sectors
+  // costs a few kilobytes where persisting the whole chip would cost half a
+  // megabyte.
+  //
+  // Typical use by a host page:
+  //
+  //   const nes = new NES({ onFlashChange: () => scheduleSave() });
+  //   // ... later, once the ROM is loaded and a save exists on the server:
+  //   for (const { index, bytes } of saved) nes.writeFlashSector(index, bytes);
+  //   // ... and when scheduleSave() finally fires:
+  //   const sectors = nes.getDirtyFlashSectors()
+  //     .map((index) => ({ index, bytes: nes.readFlashSector(index) }));
+  //   nes.clearDirtyFlashSectors();
+  //
+  // Every method here returns a harmless value (false, 0, an empty array)
+  // rather than throwing when the loaded cartridge has no flash, so a host
+  // does not have to branch on the mapper before asking.
+  // ------------------------------------------------------------------
+
+  /** The flash chip, or null if this cartridge has none. */
+  getFlash() {
+    return this.mmap && this.mmap.flash ? this.mmap.flash : null;
+  }
+
+  /** True when the loaded cartridge can rewrite its own flash, i.e. can save. */
+  hasFlash() {
+    return this.getFlash() !== null;
+  }
+
+  /** Bytes per sector, the unit every sector method below works in. */
+  getFlashSectorSize() {
+    const flash = this.getFlash();
+    return flash === null ? 0 : SECTOR_SIZE;
+  }
+
+  /** How many sectors the cartridge's flash has. */
+  getFlashSectorCount() {
+    const flash = this.getFlash();
+    return flash === null ? 0 : flash.sectorCount;
+  }
+
+  /**
+   * Sectors the running game has modified since clearDirtyFlashSectors().
+   *
+   * @returns {number[]} ascending sector indices; empty if there is no flash.
+   */
+  getDirtyFlashSectors() {
+    const flash = this.getFlash();
+    return flash === null ? [] : flash.getDirtySectors();
+  }
+
+  /** Forget the dirty set, once a host has persisted those sectors. */
+  clearDirtyFlashSectors() {
+    const flash = this.getFlash();
+    if (flash !== null) {
+      flash.clearDirtySectors();
+    }
+  }
+
+  /**
+   * Read one sector out, to be saved.
+   *
+   * @param {number} sectorIndex
+   * @returns {Uint8Array|null} a copy, or null if there is no flash.
+   */
+  readFlashSector(sectorIndex) {
+    const flash = this.getFlash();
+    return flash === null ? null : flash.readSector(sectorIndex);
+  }
+
+  /**
+   * Write one sector back, restoring a save.
+   *
+   * Restoring does not mark the sector dirty: the host already holds these
+   * bytes, and marking them would have the very next save write them straight
+   * back out again.
+   *
+   * @param {number} sectorIndex
+   * @param {ArrayLike<number>} bytes - exactly getFlashSectorSize() bytes.
+   * @returns {boolean} false if this cartridge has no flash to restore into.
+   */
+  writeFlashSector(sectorIndex, bytes) {
+    const flash = this.getFlash();
+    if (flash === null) {
+      return false;
+    }
+    flash.writeSector(sectorIndex, bytes);
+    return true;
+  }
+
+  /**
+   * The whole chip, for a host that would rather hold one blob.
+   *
+   * @returns {Uint8Array|null}
+   */
+  getFlashData() {
+    const flash = this.getFlash();
+    return flash === null ? null : flash.snapshot();
+  }
+
+  /**
+   * Replace the whole chip's contents.
+   *
+   * @param {ArrayLike<number>} bytes - exactly as long as getFlashData().
+   * @returns {boolean} false if this cartridge has no flash.
+   */
+  setFlashData(bytes) {
+    const flash = this.getFlash();
+    if (flash === null) {
+      return false;
+    }
+    flash.restore(bytes);
+    return true;
   }
 
   toJSON() {

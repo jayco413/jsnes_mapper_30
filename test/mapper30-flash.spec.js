@@ -472,3 +472,288 @@ describe("UNROM 512 self-flashing", function () {
     assert.strictEqual(mapper.flash, null);
   });
 });
+
+// A game on this board saves by rewriting its own flash, and in an emulator
+// that data disappears with the page unless a host copies it out and puts it
+// back. These cover the two halves of making that possible: knowing WHEN the
+// save changed, and moving the bytes in and out without going through the
+// command state machine.
+describe("flash persistence", function () {
+  let banks = null;
+  let flash = null;
+  let changes = null;
+
+  beforeEach(function () {
+    banks = [
+      new Uint8Array(16384).fill(0xff),
+      new Uint8Array(16384).fill(0xff),
+    ];
+    changes = [];
+    flash = new Flash39SF040(banks, {
+      bankSize: 0x4000,
+      busyReads: 0,
+      onChange: (sectorIndex) => changes.push(sectorIndex),
+    });
+  });
+
+  function program(address, value) {
+    flash.write(0x5555, 0xaa);
+    flash.write(0x2aaa, 0x55);
+    flash.write(0x5555, 0xa0);
+    flash.write(address, value);
+  }
+
+  function erase(address) {
+    flash.write(0x5555, 0xaa);
+    flash.write(0x2aaa, 0x55);
+    flash.write(0x5555, 0x80);
+    flash.write(0x5555, 0xaa);
+    flash.write(0x2aaa, 0x55);
+    flash.write(address, 0x30);
+  }
+
+  it("reports the sector a program actually changed", function () {
+    // 0x5000 is in the sixth 4 KB sector, so this also proves the reported
+    // index is the address's own sector rather than always zero - and that it
+    // is a SECTOR index, not the 16 KB bank index that 0x5000 would give.
+    program(0x5000, 0x42);
+    assert.deepStrictEqual(changes, [5]);
+    assert.deepStrictEqual(flash.getDirtySectors(), [5]);
+  });
+
+  it("stays silent when a program changes nothing", function () {
+    // Programming $FF clears no bits, which is a legal and common no-op - a
+    // save routine may issue a great many of them. Reporting these would have
+    // a host writing an identical save to the server over and over.
+    program(0x0000, 0xff);
+    assert.deepStrictEqual(changes, []);
+    assert.deepStrictEqual(flash.getDirtySectors(), []);
+
+    // Same again for re-writing a byte's existing value.
+    program(0x0000, 0x0f);
+    assert.deepStrictEqual(changes, [0]);
+    program(0x0000, 0x0f);
+    assert.deepStrictEqual(
+      changes,
+      [0],
+      "an identical re-program is not a change",
+    );
+  });
+
+  it("collapses many writes to one sector into one dirty sector", function () {
+    for (let offset = 0; offset < 200; offset += 1) {
+      program(offset, 0x00);
+    }
+    assert.deepStrictEqual(
+      flash.getDirtySectors(),
+      [0],
+      "a save routine programming hundreds of bytes should still cost one sector to persist",
+    );
+    assert.strictEqual(
+      changes.length,
+      200,
+      "the signal itself fires per changed byte",
+    );
+  });
+
+  it("reports an erase only when the sector was not already erased", function () {
+    // Preparing space it has not used yet is something a save system does
+    // routinely, and it leaves the data identical.
+    erase(0x0000);
+    assert.deepStrictEqual(
+      changes,
+      [],
+      "erasing an already-erased sector changes nothing",
+    );
+
+    program(0x0000, 0x00);
+    changes.length = 0;
+    flash.clearDirtySectors();
+
+    erase(0x0000);
+    assert.deepStrictEqual(changes, [0]);
+    assert.deepStrictEqual(flash.getDirtySectors(), [0]);
+  });
+
+  it("reports a chip erase per sector that was not already erased", function () {
+    program(0x0000, 0x00);
+    program(0x5000, 0x00);
+    changes.length = 0;
+
+    flash.write(0x5555, 0xaa);
+    flash.write(0x2aaa, 0x55);
+    flash.write(0x5555, 0x80);
+    flash.write(0x5555, 0xaa);
+    flash.write(0x2aaa, 0x55);
+    flash.write(0x5555, 0x10);
+
+    assert.deepStrictEqual(
+      changes,
+      [0, 5],
+      "only the two sectors that held data",
+    );
+  });
+
+  it("carries a sector out and back unchanged", function () {
+    program(0x0010, 0x42);
+    program(0x0011, 0x43);
+
+    const saved = flash.readSector(0);
+    assert.strictEqual(saved.length, SECTOR_SIZE);
+    assert.strictEqual(saved[0x10], 0x42);
+    assert.strictEqual(saved[0x11], 0x43);
+
+    // Wipe it the way starting a new game would, then put the save back.
+    erase(0x0000);
+    assert.strictEqual(flash.byteAt(0x0010), 0xff);
+
+    flash.writeSector(0, saved);
+    assert.strictEqual(flash.byteAt(0x0010), 0x42);
+    assert.strictEqual(flash.byteAt(0x0011), 0x43);
+  });
+
+  it("hands back a copy, not a view into the live banks", function () {
+    program(0x0010, 0x42);
+    const saved = flash.readSector(0);
+    program(0x0010, 0x00);
+    assert.strictEqual(
+      saved[0x10],
+      0x42,
+      "a host holds this while the game keeps running; a view would change underneath it",
+    );
+  });
+
+  it("restores a sector without the program-only-clears-bits rule", function () {
+    // THE POINT OF writeSector NOT GOING THROUGH THE COMMAND PATH. Programming
+    // can only turn 1 bits into 0 bits, so a saved $FF can never be programmed
+    // back over a stored $00. A restore that went through the state machine
+    // would silently corrupt every save it loaded.
+    program(0x0020, 0x00);
+    assert.strictEqual(flash.byteAt(0x0020), 0x00);
+
+    const restored = new Uint8Array(SECTOR_SIZE).fill(0xff);
+    restored[0x20] = 0xff;
+    flash.writeSector(0, restored);
+
+    assert.strictEqual(flash.byteAt(0x0020), 0xff);
+  });
+
+  it("does not mark a restored sector dirty", function () {
+    // Dirty means "the emulated game changed this". Marking a restore would
+    // make every page load look like a fresh save and write it straight back
+    // out again.
+    flash.writeSector(1, new Uint8Array(SECTOR_SIZE).fill(0x7f));
+    assert.deepStrictEqual(flash.getDirtySectors(), []);
+    assert.deepStrictEqual(changes, []);
+  });
+
+  it("forgets the dirty set on request", function () {
+    program(0x0000, 0x00);
+    assert.deepStrictEqual(flash.getDirtySectors(), [0]);
+    flash.clearDirtySectors();
+    assert.deepStrictEqual(flash.getDirtySectors(), []);
+  });
+
+  it("refuses a sector payload that is the wrong size", function () {
+    assert.throws(
+      () => flash.writeSector(0, new Uint8Array(16)),
+      /must be 4096 bytes/,
+    );
+    assert.throws(() => flash.writeSector(0, null), /got nothing/);
+  });
+
+  it("refuses a sector index outside the chip", function () {
+    const payload = new Uint8Array(SECTOR_SIZE);
+    assert.throws(() => flash.writeSector(-1, payload), /out of range/);
+    assert.throws(
+      () => flash.writeSector(flash.sectorCount, payload),
+      /out of range/,
+    );
+    assert.throws(() => flash.readSector(1.5), /out of range/);
+  });
+
+  it("counts its sectors from the banks it was given", function () {
+    // Two 16 KB banks is 32 KB, which is eight 4 KB sectors.
+    assert.strictEqual(flash.sectorCount, 8);
+    assert.strictEqual(flash.sectorIndexOf(0x0000), 0);
+    assert.strictEqual(flash.sectorIndexOf(0x0fff), 0);
+    assert.strictEqual(flash.sectorIndexOf(0x1000), 1);
+    assert.strictEqual(flash.sectorIndexOf(0x7fff), 7);
+  });
+
+  it("snapshots and restores the whole chip", function () {
+    program(0x0000, 0x11);
+    program(0x4000, 0x22);
+
+    const image = flash.snapshot();
+    assert.strictEqual(image.length, flash.size);
+    assert.strictEqual(image[0x0000], 0x11);
+    assert.strictEqual(image[0x4000], 0x22);
+
+    banks[0].fill(0xff);
+    banks[1].fill(0xff);
+    flash.restore(image);
+
+    assert.strictEqual(flash.byteAt(0x0000), 0x11);
+    assert.strictEqual(flash.byteAt(0x4000), 0x22);
+    assert.deepStrictEqual(
+      flash.getDirtySectors(),
+      [0, 4],
+      "restore leaves the pre-existing dirty set alone rather than adding to it",
+    );
+  });
+
+  it("refuses a whole-chip image that is the wrong size", function () {
+    assert.throws(
+      () => flash.restore(new Uint8Array(10)),
+      /must be 32768 bytes/,
+    );
+    assert.throws(() => flash.restore(null), /got nothing/);
+  });
+});
+
+// The same thing seen from where a host page actually sits: the NES options
+// object and the mapper, rather than the chip directly.
+describe("UNROM 512 save persistence through the mapper", function () {
+  it("forwards flash changes to the onFlashChange option", function () {
+    const nes = createNes();
+    const seen = [];
+    nes.opts.onFlashChange = (sectorIndex) => seen.push(sectorIndex);
+
+    const mapper = new Mappers[30](nes);
+    mapper.loadROM();
+
+    programByte(mapper, 28, 0x8123, 0x42);
+    waitReady(mapper);
+
+    // Bank 28 at offset $0123 is byte 28 * 16384 + 0x123 of the chip, which
+    // falls in sector 112.
+    assert.deepStrictEqual(seen, [112]);
+    assert.deepStrictEqual(mapper.flash.getDirtySectors(), [112]);
+  });
+
+  it("says nothing when the cartridge cannot flash", function () {
+    // A plain mapper-30 ROM has no flash at all, and a host must be able to
+    // ask without checking the mapper first.
+    const nes = createNes({ batteryRam: false });
+    const mapper = new Mappers[30](nes);
+    mapper.loadROM();
+    assert.strictEqual(mapper.flash, null);
+  });
+
+  it("survives a reset, the way a cartridge survives the power switch", function () {
+    // reset() rebuilds the mapper, and therefore the flash object, over the
+    // same bank arrays. The DATA must persist - that is what makes it a save -
+    // even though the dirty set, which is bookkeeping for the host, does not.
+    const nes = createNes();
+    const mapper = new Mappers[30](nes);
+    mapper.loadROM();
+
+    programByte(mapper, 28, 0x8123, 0x42);
+    waitReady(mapper);
+
+    const rebuilt = new Mappers[30](nes);
+    rebuilt.loadROM();
+    assert.strictEqual(rebuilt.flash.byteAt(28 * 16384 + 0x123), 0x42);
+  });
+});

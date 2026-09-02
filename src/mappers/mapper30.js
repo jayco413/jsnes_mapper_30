@@ -87,7 +87,19 @@ class Mapper30 extends Mapper0 {
     if (this.hasBusConflicts()) {
       return null;
     }
-    return new Flash39SF040(rom.rom, { bankSize: 0x4000 });
+    return new Flash39SF040(rom.rom, {
+      bankSize: 0x4000,
+      // Forwarded from the NES options so a host page can persist the
+      // player's save. Read from `nes.opts` at construction time rather than
+      // captured once, because reset() rebuilds the mapper - and therefore
+      // this flash - while the option stays put.
+      onChange: (sectorIndex, flash) => {
+        const handler = this.nes.opts.onFlashChange;
+        if (typeof handler === "function") {
+          handler(sectorIndex, flash);
+        }
+      },
+    });
   }
 
   write(address, value) {

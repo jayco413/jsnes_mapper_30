@@ -27,6 +27,42 @@
  *
  * Reference: the SST39SF040 datasheet's command table, and NESdev's UNROM 512
  * page, which documents the exact sequences an NES game must use.
+ *
+ * REPORTING CHANGES, AND WHY A HOST NEEDS IT
+ *
+ * On a real cartridge the flash IS the save file: it keeps its contents when
+ * the console is switched off, and there is nothing else to store. An
+ * emulator has no such luxury. Its "cartridge" is an array that disappears
+ * when the page closes, so unless something copies the changed bytes out and
+ * puts them back next time, the player's saved game is lost every session -
+ * the game saves correctly, and the save evaporates.
+ *
+ * Copying the bytes out needs two things this file did not previously offer:
+ *
+ *   A SIGNAL. A host cannot poll half a megabyte every frame looking for a
+ *   difference. So `onChange` is called whenever a program or erase actually
+ *   modifies stored data, with the index of the 4 KB sector that changed.
+ *
+ *   A UNIT. Persisting the whole chip to save a few hundred bytes of progress
+ *   is wasteful, so changes are tracked and exposed per SECTOR - the chip's
+ *   own erase granularity, and therefore the smallest region a game can
+ *   rewrite from scratch. `getDirtySectors` says which ones the game has
+ *   touched; `readSector`/`writeSector` move one out and back.
+ *
+ * One rule decides when the signal fires, and it is worth stating plainly
+ * because the obvious implementation gets it wrong: the signal reports
+ * CHANGED DATA, not attempted writes. Programming $FF over a byte is a legal,
+ * common no-op on flash (it clears no bits), and a game's save routine may
+ * issue a great many of them. Reporting those would have a host writing an
+ * identical save to the server over and over. So every path below compares
+ * before and after, and stays silent when nothing moved.
+ *
+ * The reverse direction - a host calling `writeSector` or `restore` to put a
+ * previous session's save back - deliberately does NOT mark anything dirty
+ * and does NOT fire `onChange`. Dirty means "the emulated game changed this",
+ * and restoring is the host putting back what it already holds. Marking it
+ * would make every page load look like a fresh save and write it straight
+ * back out again.
  */
 
 // Commands are recognised on these addresses. Only address lines A14-A0
@@ -102,6 +138,10 @@ class Flash39SF040 {
    * @param {object} [options]
    * @param {number} [options.bankSize] - bytes per bank (16384 on this board).
    * @param {number} [options.busyReads] - see DEFAULT_BUSY_READS.
+   * @param {(sectorIndex: number, flash: Flash39SF040) => void} [options.onChange]
+   *   called when a program or erase actually modifies stored data. See
+   *   "REPORTING CHANGES" above: it fires per changed sector, and never for a
+   *   write that left the data as it was.
    */
   constructor(banks, options = {}) {
     this.banks = banks;
@@ -127,6 +167,157 @@ class Flash39SF040 {
     this.sectorEraseCount = 0;
     this.chipEraseCount = 0;
     this.rejectedWriteCount = 0;
+
+    // How a host learns that the player's save changed. Null by default, so a
+    // caller that does not care pays nothing.
+    this.onChange = options.onChange ?? null;
+
+    // Which sectors the emulated game has modified since the host last
+    // cleared this. A Set, so a save routine that programs two hundred bytes
+    // into one sector still records exactly one sector to persist.
+    this.dirtySectors = new Set();
+  }
+
+  /** How many 4 KB sectors this chip has. */
+  get sectorCount() {
+    return Math.floor(this.size / SECTOR_SIZE);
+  }
+
+  /** Which sector a chip address falls in. */
+  sectorIndexOf(chipAddress) {
+    return Math.floor((chipAddress % this.size) / SECTOR_SIZE);
+  }
+
+  /**
+   * Record that the game changed a sector, and tell the host.
+   *
+   * Only ever called from a path that has already established that the data
+   * really did change - see the file header.
+   */
+  noteSectorChanged(sectorIndex) {
+    this.dirtySectors.add(sectorIndex);
+    if (this.onChange !== null) {
+      this.onChange(sectorIndex, this);
+    }
+  }
+
+  /**
+   * Sectors modified by the emulated game since clearDirtySectors().
+   *
+   * @returns {number[]} ascending sector indices.
+   */
+  getDirtySectors() {
+    return [...this.dirtySectors].sort((a, b) => a - b);
+  }
+
+  /** Forget which sectors are dirty, after a host has persisted them. */
+  clearDirtySectors() {
+    this.dirtySectors.clear();
+  }
+
+  /**
+   * Copy one sector out, for saving.
+   *
+   * Returns a COPY rather than a view into the bank, because the caller is
+   * about to hold these bytes while the game keeps running, and a view would
+   * keep changing underneath them.
+   *
+   * @param {number} sectorIndex
+   * @returns {Uint8Array} SECTOR_SIZE bytes.
+   */
+  readSector(sectorIndex) {
+    this.assertSectorIndex(sectorIndex);
+    const start = sectorIndex * SECTOR_SIZE;
+    const out = new Uint8Array(SECTOR_SIZE);
+    for (let offset = 0; offset < SECTOR_SIZE; offset += 1) {
+      out[offset] = this.byteAt(start + offset);
+    }
+    return out;
+  }
+
+  /**
+   * Put one sector back, restoring a previous session's save.
+   *
+   * This writes straight into the banks rather than going through the command
+   * state machine, and that is deliberate: it is the host loading a cartridge
+   * that already held this data, not the game programming it. The
+   * program-only-clears-bits rule therefore does not apply and must not be
+   * imposed - applying it would corrupt every restore, because a saved $FF
+   * cannot be programmed back over a stored $00.
+   *
+   * Does not mark the sector dirty - see the file header.
+   *
+   * @param {number} sectorIndex
+   * @param {ArrayLike<number>} bytes - exactly SECTOR_SIZE bytes.
+   */
+  writeSector(sectorIndex, bytes) {
+    this.assertSectorIndex(sectorIndex);
+    if (!bytes || bytes.length !== SECTOR_SIZE) {
+      throw new Error(
+        "Flash sector data must be " +
+          SECTOR_SIZE +
+          " bytes, got " +
+          (bytes ? bytes.length : "nothing"),
+      );
+    }
+    const start = sectorIndex * SECTOR_SIZE;
+    for (let offset = 0; offset < SECTOR_SIZE; offset += 1) {
+      this.setByteAt(start + offset, bytes[offset]);
+    }
+  }
+
+  assertSectorIndex(sectorIndex) {
+    if (
+      !Number.isInteger(sectorIndex) ||
+      sectorIndex < 0 ||
+      sectorIndex >= this.sectorCount
+    ) {
+      throw new Error(
+        "Flash sector " +
+          sectorIndex +
+          " is out of range 0.." +
+          (this.sectorCount - 1),
+      );
+    }
+  }
+
+  /**
+   * The entire chip as one array, for a whole-cartridge save.
+   *
+   * Sector at a time is the cheaper way to persist progress; this exists for
+   * callers that would rather hold the lot, such as a test or a tool writing
+   * a .nes file back out.
+   *
+   * @returns {Uint8Array} a copy, `size` bytes long.
+   */
+  snapshot() {
+    const out = new Uint8Array(this.size);
+    for (let bank = 0; bank < this.banks.length; bank += 1) {
+      out.set(this.banks[bank], bank * this.bankSize);
+    }
+    return out;
+  }
+
+  /**
+   * Replace the entire chip's contents. Does not mark anything dirty.
+   *
+   * @param {ArrayLike<number>} bytes - exactly `size` bytes.
+   */
+  restore(bytes) {
+    if (!bytes || bytes.length !== this.size) {
+      throw new Error(
+        "Flash image must be " +
+          this.size +
+          " bytes, got " +
+          (bytes ? bytes.length : "nothing"),
+      );
+    }
+    for (let bank = 0; bank < this.banks.length; bank += 1) {
+      const start = bank * this.bankSize;
+      for (let offset = 0; offset < this.bankSize; offset += 1) {
+        this.banks[bank][offset] = bytes[start + offset] & 0xff;
+      }
+    }
   }
 
   get size() {
@@ -274,6 +465,15 @@ class Flash39SF040 {
         const programmed = previous & data;
         this.setByteAt(chipAddress, programmed);
         this.programCount += 1;
+        // Only a program that cleared at least one bit changed anything.
+        // Writing $FF, or re-writing a byte's existing value, is a legal
+        // no-op that a save routine may perform in bulk, and reporting those
+        // would have a host re-persisting an identical save. The operation
+        // still costs its busy period either way: the chip does not shortcut
+        // it, and a game polling for completion must still poll.
+        if (programmed !== previous) {
+          this.noteSectorChanged(this.sectorIndexOf(chipAddress));
+        }
         this.beginBusy(programmed, this.busyReadsProgram);
         this.state = STATE_READ;
         return;
@@ -330,18 +530,39 @@ class Flash39SF040 {
     this.busyExpectedValue = expectedValue & 0xff;
   }
 
-  /** Sets every byte of the containing 4 KB sector to $FF. */
+  /**
+   * Sets every byte of the containing 4 KB sector to $FF.
+   *
+   * Reports the sector as changed only if some byte in it was not already
+   * $FF. Erasing an already-erased sector is something a save system does
+   * routinely - it is how it prepares space it has not used yet - and it
+   * leaves the data identical, so it is not a change worth persisting.
+   */
   eraseSector(chipAddress) {
     const address = chipAddress % this.size;
     const start = address - (address % SECTOR_SIZE);
+    let changed = false;
     for (let offset = 0; offset < SECTOR_SIZE; offset += 1) {
-      this.setByteAt(start + offset, ERASED_BYTE);
+      if (this.byteAt(start + offset) !== ERASED_BYTE) {
+        changed = true;
+        this.setByteAt(start + offset, ERASED_BYTE);
+      }
+    }
+    if (changed) {
+      this.noteSectorChanged(Math.floor(start / SECTOR_SIZE));
     }
   }
 
+  /**
+   * Sets the whole chip to $FF, reporting each sector that was not already.
+   *
+   * Written in terms of eraseSector rather than filling the banks directly,
+   * so that the "only report what actually changed" rule lives in exactly one
+   * place and a host sees the same per-sector shape from every path.
+   */
   eraseChip() {
-    for (const bank of this.banks) {
-      bank.fill(ERASED_BYTE);
+    for (let sector = 0; sector < this.sectorCount; sector += 1) {
+      this.eraseSector(sector * SECTOR_SIZE);
     }
   }
 }
